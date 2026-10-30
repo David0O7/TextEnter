@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TextEnter - Templates and Quick Replies
 // @namespace    https://textenter.local/
-// @version      0.2
+// @version      0.3
 // @description  Message templates, tags, // menu, custom variables, tagged people profiles, backups, and isolated settings workspace
 // @author       TextEnter Studio
 // @license      MIT
@@ -3706,6 +3706,44 @@
     var dbRecId = "";
     var dbRenamingCat = null;
 
+    // ---------- v0.3: память состояния UI (последняя вкладка и выбор) ----------
+    var UI_KEY = "textenter_ui_v1";
+
+    function persistUiState() {
+      try {
+        safeSet(UI_KEY, JSON.stringify({
+          tab: activeTab,
+          tpl: selectedTemplateId,
+          variable: selectedVariableId
+        }));
+      } catch (error) { /* ignore */ }
+    }
+
+    function restoreUiState() {
+      try {
+        var raw = safeGet(UI_KEY, "");
+        if (!raw) {
+          return;
+        }
+        var st = JSON.parse(raw);
+        if (st) {
+          if (["templates", "variables", "general", "settings", "help"].indexOf(st.tab) !== -1) {
+            activeTab = st.tab;
+          }
+          if (st.tpl && draft.templates.some(function (t) { return t.id === st.tpl; })) {
+            selectedTemplateId = st.tpl;
+          }
+          if (st.variable && draft.customVariables.some(function (v) { return v.id === st.variable; })) {
+            selectedVariableId = st.variable;
+          }
+        }
+      } catch (error) {
+        debugLog("restoreUiState: failed", error);
+      }
+    }
+
+    restoreUiState();
+
     // ---------- v0.2: защита черновика ----------
     // Черновик автосохраняется в GM-хранилище (каждые 15с и перед закрытием вкладки),
     // чтобы случайное закрытие настроек не теряло правки. При следующем открытии
@@ -3727,17 +3765,33 @@
       }
     }
 
+    function setAutosaveStatus(text) {
+      // v0.3: строка статуса в шапке настроек.
+      try {
+        var el = root.querySelector("#textenter-autosave-status");
+        if (el) {
+          el.textContent = text || "";
+        }
+      } catch (error) { /* ignore */ }
+    }
+
     function markDraftClean() {
       try {
         savedDraftSnapshot = JSON.stringify(draft);
       } catch (error) { /* ignore */ }
       safeSet(DRAFT_KEY, "");
+      setAutosaveStatus("");
+      try {
+        document.title = "TextEnter - Настройки";
+      } catch (error) { /* ignore */ }
     }
 
     function saveDraftSnapshot() {
       try {
         if (isDraftDirty()) {
           safeSet(DRAFT_KEY, JSON.stringify({ at: new Date().toISOString(), data: draft }));
+          var t = new Date();
+          setAutosaveStatus("Черновик в автосейве · " + ("0" + t.getHours()).slice(-2) + ":" + ("0" + t.getMinutes()).slice(-2) + ":" + ("0" + t.getSeconds()).slice(-2));
         }
       } catch (error) {
         debugLog("saveDraftSnapshot: failed", error);
@@ -4400,7 +4454,15 @@
         ".checkrow{display:flex;gap:8px;align-items:flex-start}",
         ".checkrow input[type=checkbox]{margin-top:3px}",
         ".backup{border:1px solid #263041;border-radius:10px;padding:8px 10px;margin-top:8px;display:flex;justify-content:space-between;gap:8px;align-items:center}",
-        "select.field{appearance:auto}"
+        "select.field{appearance:auto}",
+        // v0.3: индикатор черновика и справочник.
+        ".btn.primary.attention{box-shadow:0 0 0 2px rgba(245,158,11,0.55)}",
+        ".ref-card{border:1px solid #263041;border-radius:10px;padding:12px 14px;margin-top:12px;background:#10151f}",
+        ".ref-title{font-weight:600;margin-bottom:4px}",
+        ".ref-note{color:#9ca3af;font-size:13px;margin-bottom:8px}",
+        ".ref-row{display:flex;gap:10px;padding:3px 0;align-items:baseline}",
+        ".ref-row code{flex:0 0 auto;cursor:pointer}",
+        ".ref-row .d{color:#9ca3af;font-size:13px}"
       ].join("\n");
       root.appendChild(style);
 
@@ -4412,7 +4474,8 @@
       head.className = "head";
       head.innerHTML =
         "<div><h1>TextEnter - Настройки расширения</h1>" +
-        "<p>Все изменения работают как черновик и применяются только после кнопки Сохранить.</p></div>";
+        "<p>Все изменения работают как черновик и применяются только после кнопки Сохранить. " +
+        '<span id="textenter-autosave-status" class="muted"></span></p></div>';
 
       var headerActions = document.createElement("div");
       headerActions.className = "actions";
@@ -4426,6 +4489,16 @@
         toast("Изменения сохранены, предыдущая версия — в бэкапах (вкладка «Настройки»)", "ok");
         renderLayout();
       });
+
+      // v0.3: индикатор грязного черновика (точка на кнопке + * в заголовке вкладки).
+      function refreshDirtyIndicator() {
+        try {
+          var dirty = isDraftDirty();
+          saveBtn.textContent = "Сохранить (Ctrl+S)" + (dirty ? " •" : "");
+          saveBtn.classList.toggle("attention", dirty);
+          document.title = (dirty ? "* " : "") + "TextEnter - Настройки";
+        } catch (error) { /* ignore */ }
+      }
 
       var exportBtn = document.createElement("button");
       exportBtn.className = "btn";
@@ -4543,6 +4616,10 @@
           }
         } catch (error) { /* ignore */ }
       }
+
+      // v0.3: обновляем индикатор черновика и запоминаем состояние UI.
+      refreshDirtyIndicator();
+      persistUiState();
     }
 
     function renderTemplatesTab(target) {
@@ -4642,14 +4719,23 @@
         if (!current) {
           return;
         }
-        if (!window.confirm("Удалить шаблон: " + current.name + "?")) {
-          return;
-        }
+        // v0.3: без confirm — удаление с возможностью отмены из тоста.
+        var idx = draft.templates.indexOf(current);
         draft.templates = draft.templates.filter(function (tpl) {
           return tpl.id !== current.id;
         });
         selectedTemplateId = draft.templates[0] ? draft.templates[0].id : "";
         renderLayout();
+        toast("Шаблон удалён: " + current.name, "ok", {
+          label: "Отменить",
+          fn: function () {
+            var removed = JSON.parse(JSON.stringify(current));
+            var at = Math.min(idx, draft.templates.length);
+            draft.templates.splice(at, 0, removed);
+            selectedTemplateId = removed.id;
+            renderLayout();
+          }
+        });
       });
 
       var fixTagsBtn = document.createElement("button");
@@ -4692,6 +4778,92 @@
       listActions.appendChild(dupBtn);
       listActions.appendChild(delBtn);
       listActions.appendChild(fixTagsBtn);
+      // v0.3: массовые операции над выбранными (чекбоксами) шаблонами.
+      var selectedCount = Object.keys(selectedIds).length;
+      if (selectedCount > 0) {
+        var massMoveBtn = document.createElement("button");
+        massMoveBtn.className = "btn";
+        massMoveBtn.textContent = "⇒ В папку (" + selectedCount + ")";
+        massMoveBtn.title = "Переместить выбранные шаблоны в папку";
+        massMoveBtn.addEventListener("click", function () {
+          var ids = Object.keys(selectedIds);
+          var overlay = document.createElement("div");
+          overlay.style.cssText =
+            "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;";
+          var box = document.createElement("div");
+          box.style.cssText =
+            "background:#111827;border:1px solid #374151;border-radius:10px;padding:20px;max-width:380px;width:90%;color:#e5e7eb;";
+          var title = document.createElement("div");
+          title.style.fontWeight = "600";
+          title.style.marginBottom = "10px";
+          title.textContent = "Переместить " + ids.length + " шаблон(ов) в папку:";
+          box.appendChild(title);
+          folderListFrom(draft).forEach(function (folder) {
+            var fb = document.createElement("button");
+            fb.type = "button";
+            fb.className = "btn";
+            fb.style.cssText = "display:block;width:100%;text-align:left;margin-top:6px;";
+            fb.textContent = folderDisplayName(folder, draft);
+            fb.addEventListener("click", function () {
+              draft.templates.forEach(function (tpl) {
+                if (selectedIds[tpl.id]) {
+                  tpl.folder = folder;
+                }
+              });
+              selectedIds = {};
+              if (overlay.parentNode) {
+                overlay.parentNode.removeChild(overlay);
+              }
+              renderLayout();
+              toast("Перемещено в «" + folder + "». Нажмите Сохранить.", "ok");
+            });
+            box.appendChild(fb);
+          });
+          var cancelB = document.createElement("button");
+          cancelB.type = "button";
+          cancelB.className = "btn danger";
+          cancelB.style.cssText = "display:block;width:100%;text-align:left;margin-top:10px;";
+          cancelB.textContent = "Отмена";
+          cancelB.addEventListener("click", function () {
+            if (overlay.parentNode) {
+              overlay.parentNode.removeChild(overlay);
+            }
+          });
+          box.appendChild(cancelB);
+          overlay.appendChild(box);
+          document.body.appendChild(overlay);
+        });
+
+        var massDelBtn = document.createElement("button");
+        massDelBtn.className = "btn danger";
+        massDelBtn.textContent = "Удалить выбранные (" + selectedCount + ")";
+        massDelBtn.addEventListener("click", function () {
+          var ids = Object.keys(selectedIds);
+          var removed = draft.templates.filter(function (tpl) {
+            return selectedIds[tpl.id];
+          }).map(function (tpl) {
+            return JSON.parse(JSON.stringify(tpl));
+          });
+          draft.templates = draft.templates.filter(function (tpl) {
+            return !selectedIds[tpl.id];
+          });
+          selectedIds = {};
+          selectedTemplateId = draft.templates[0] ? draft.templates[0].id : "";
+          renderLayout();
+          toast("Удалено шаблонов: " + removed.length, "ok", {
+            label: "Отменить",
+            fn: function () {
+              removed.forEach(function (tpl) {
+                draft.templates.push(tpl);
+              });
+              renderLayout();
+            }
+          });
+        });
+
+        listActions.appendChild(massMoveBtn);
+        listActions.appendChild(massDelBtn);
+      }
       // v3.4.0: создание папки прямо здесь (вкладки Папки больше нет).
       var addFolderBtn = document.createElement("button");
       addFolderBtn.className = "btn";
@@ -5698,11 +5870,43 @@
         }
       });
 
+      // v0.3: подсказки-тултипы для палитры токенов.
+      var tokenHintText = {
+        "{{name}}": "Имя активного человека (или выбранного при вставке)",
+        "{{surname}}": "Фамилия",
+        "{{fullname}}": "Имя + фамилия",
+        "{{company}}": "Компания",
+        "{{email}}": "Email",
+        "{{phone}}": "Телефон",
+        "{{position}}": "Должность",
+        "{{name:tag}}": "Имя человека по тегу — замените tag на свой тег",
+        "{{phone:tag}}": "Телефон человека по тегу",
+        "{{date}}": "Дата №1 — спросит при вставке",
+        "{{date+1}}": "Дата №1 плюс 1 день",
+        "{{date2}}": "Независимая дата №2 — спросит отдельно",
+        "{{date2+1}}": "Дата №2 плюс 1 день",
+        '{{date("Дата начала")}}': "Дата с подписью «Дата начала» в окне вставки",
+        '{{date+7("Дата начала")}}': "Дата №1 плюс 7 дней, с подписью",
+        "{{datetoday}}": "Сегодняшняя дата — не спрашивает",
+        "{{datetoday+1}}": "Завтрашняя дата",
+        "{{time}}": "Время №1 — спросит при вставке",
+        "{{time+1}}": "Время №1 плюс 1 час",
+        "{{time2}}": "Независимое время №2",
+        '{{time("Время встречи")}}': "Время с подписью «Время встречи»",
+        "{{timetoday}}": "Текущее время — не спрашивает",
+        "{{timetoday-1}}": "Текущее время минус 1 час",
+        "{{calc:1200*1.2}}": "Математика — замените на свою формулу",
+        "{{text}}": "Свободный ввод с клавиатуры при вставке",
+        "{{text2}}": "Второй свободный ввод",
+        '{{text("Комментарий")}}': "Свободный ввод с подписью «Комментарий»"
+      };
+
       tokenHints.forEach(function (token) {
         var btn = document.createElement("button");
         btn.type = "button";
         btn.className = "token-btn";
         btn.textContent = token;
+        btn.title = tokenHintText[token] || "Вставить в текст";
         btn.addEventListener("click", function () {
           insertTokenIntoBody(token);
           bodyEl.focus();
@@ -5994,6 +6198,32 @@
       var split = document.createElement("div");
       split.className = "split";
       target.appendChild(split);
+
+      // v0.3: песочница — проверка выражений без сохранения и походов на сайт.
+      var sandbox = document.createElement("div");
+      sandbox.className = "panel";
+      sandbox.style.marginBottom = "12px";
+      var sandboxInput = document.createElement("input");
+      sandboxInput.className = "field";
+      sandboxInput.placeholder = 'Песочница: введите текст с {{...}} — например "Скидка {{calc:1200*0.2}} до {{date+3}}"';
+      var sandboxOut = document.createElement("div");
+      sandboxOut.className = "help muted";
+      sandboxOut.style.marginTop = "6px";
+      sandboxOut.textContent = "Результат появится здесь. Даты и случайные выборки подставляются сразу, {{text}} не заполняется.";
+      sandbox.appendChild(sandboxInput);
+      sandbox.appendChild(sandboxOut);
+      sandboxInput.addEventListener("input", function () {
+        var backup = config;
+        try {
+          config = draft;
+          sandboxOut.textContent = renderText(sandboxInput.value || "", null);
+        } catch (error) {
+          sandboxOut.textContent = "Ошибка: " + error;
+        } finally {
+          config = backup;
+        }
+      });
+      target.appendChild(sandbox);
 
       var left = document.createElement("div");
       left.className = "panel";
@@ -6910,8 +7140,14 @@
         '<input id="g-delay" class="field" type="number" min="0" placeholder="Задержка печати (мс)" />' +
         "</div>" +
         '<div class="line2" style="margin-top:8px">' +
-        '<input id="g-hotkey-menu" class="field" placeholder="Хоткей меню, например ctrl+shift+k" />' +
-        '<input id="g-hotkey-settings" class="field" placeholder="Хоткей настроек, например ctrl+shift+l" />' +
+        '<div style="display:flex;gap:6px;align-items:center;flex:1;min-width:0">' +
+        '<input id="g-hotkey-menu" class="field" style="flex:1;min-width:0" placeholder="Хоткей меню, например ctrl+shift+k" />' +
+        '<button id="g-hotkey-menu-rec" class="btn" type="button" title="Записать нажатием: кликните и нажмите комбинацию">◉ Записать</button>' +
+        "</div>" +
+        '<div style="display:flex;gap:6px;align-items:center;flex:1;min-width:0">' +
+        '<input id="g-hotkey-settings" class="field" style="flex:1;min-width:0" placeholder="Хоткей настроек, например ctrl+shift+l" />' +
+        '<button id="g-hotkey-settings-rec" class="btn" type="button" title="Записать нажатием: кликните и нажмите комбинацию">◉ Записать</button>' +
+        "</div>" +
         "</div>" +
         '<div style="margin-top:10px"><label><input id="g-images" type="checkbox" /> Вставлять картинки шаблона (если есть)</label></div>' +
         '<p class="muted" style="margin-top:8px">Хоткей: модификаторы через «+» — ctrl / shift / alt и буква. ' +
@@ -6946,6 +7182,159 @@
         el.addEventListener("change", saveGeneral);
       });
       imagesEl.addEventListener("change", saveGeneral);
+
+      // v0.3: запись хоткея нажатием — вместо ручного ввода.
+      function attachHotkeyCapture(recBtn, inputEl) {
+        recBtn.addEventListener("click", function () {
+          var overlay = document.createElement("div");
+          overlay.style.cssText =
+            "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;";
+          var box = document.createElement("div");
+          box.style.cssText =
+            "background:#111827;border:1px solid #374151;border-radius:10px;padding:24px;text-align:center;color:#e5e7eb;";
+          box.textContent = "Нажмите комбинацию клавиш… (Esc — отмена)";
+          overlay.appendChild(box);
+          document.body.appendChild(overlay);
+
+          function cleanup() {
+            window.removeEventListener("keydown", onKey, true);
+            if (overlay.parentNode) {
+              overlay.parentNode.removeChild(overlay);
+            }
+          }
+          function onKey(event) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.key === "Escape") {
+              cleanup();
+              return;
+            }
+            if (["Control", "Shift", "Alt", "Meta"].indexOf(event.key) !== -1) {
+              return; // пока зажат только модификатор — ждем клавишу
+            }
+            var useCtrl = event.ctrlKey || event.metaKey;
+            var useAlt = event.altKey;
+            if (!useCtrl && !useAlt) {
+              toast("Добавьте Ctrl или Alt — одиночная клавиша перехватит обычный ввод", "err");
+              return;
+            }
+            var key = "";
+            var m = /^Key([A-Z])$/.exec(String(event.code || ""));
+            if (m) {
+              key = m[1].toLowerCase();
+            } else {
+              m = /^Digit(\d)$/.exec(String(event.code || ""));
+              if (m) {
+                key = m[1];
+              } else if (/^[a-zа-яё0-9]$/i.test(String(event.key || ""))) {
+                key = String(event.key).toLowerCase();
+              }
+            }
+            if (!key) {
+              toast("Не удалось распознать клавишу, попробуйте буквенную", "err");
+              return;
+            }
+            var spec = (useCtrl ? "ctrl+" : "alt+") + (event.shiftKey ? "shift+" : "") + key;
+            inputEl.value = spec;
+            saveGeneral();
+            cleanup();
+            toast("Хоткей записан: " + (hotkeyLabel(spec) || spec), "ok");
+          }
+          window.addEventListener("keydown", onKey, true);
+        });
+      }
+      attachHotkeyCapture(panel.querySelector("#g-hotkey-menu-rec"), hkMenuEl);
+      attachHotkeyCapture(panel.querySelector("#g-hotkey-settings-rec"), hkSettingsEl);
+
+      // v0.3: панель данных — счетчики, размер, стирание.
+      var dataTitle = document.createElement("div");
+      dataTitle.className = "section-title";
+      dataTitle.style.marginTop = "14px";
+      dataTitle.textContent = "Данные";
+      target.appendChild(dataTitle);
+
+      var dataPanel = document.createElement("div");
+      dataPanel.className = "panel";
+      var recordsCount = draft.recordSets.reduce(function (n, s) {
+        return n + ((s.records || []).length);
+      }, 0);
+      var configSizeKb = Math.round(JSON.stringify(draft).length / 102.4) / 10;
+      dataPanel.innerHTML =
+        '<div class="muted" style="line-height:1.7">' +
+        "Шаблонов: <b>" + draft.templates.length + "</b> · " +
+        "Переменных: <b>" + draft.customVariables.length + "</b> · " +
+        "Папок: <b>" + folderListFrom(draft).length + "</b> · " +
+        "Записей БД: <b>" + recordsCount + "</b> · " +
+        "Бэкапов: <b>" + listBackups().length + "</b> · " +
+        "Размер конфига: <b>~" + configSizeKb + " КБ</b>" +
+        "</div>";
+      target.appendChild(dataPanel);
+
+      var wipeBtn = document.createElement("button");
+      wipeBtn.type = "button";
+      wipeBtn.className = "btn danger";
+      wipeBtn.style.marginTop = "8px";
+      wipeBtn.textContent = "Стереть все данные";
+      wipeBtn.title = "Удалить конфиг, черновик, бэкапы и настройки UI. Старые ключи formix_* не трогаем.";
+      wipeBtn.addEventListener("click", function () {
+        var overlay = document.createElement("div");
+        overlay.style.cssText =
+          "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;";
+        var box = document.createElement("div");
+        box.style.cssText =
+          "background:#111827;border:1px solid #7f1d1d;border-radius:10px;padding:20px;max-width:440px;width:90%;color:#e5e7eb;";
+        box.innerHTML =
+          "<b>Стереть все данные TextEnter?</b><br>" +
+          '<span class="muted">Конфиг, бэкапы, черновик и настройки интерфейса будут удалены безвозвратно. ' +
+          "Старые ключи Formix останутся — откат на прежнюю версию скрипта не потеряет данные.</span>";
+        var acts = document.createElement("div");
+        acts.style.cssText = "display:flex;gap:8px;justify-content:flex-end;margin-top:14px;";
+        var noB = document.createElement("button");
+        noB.type = "button";
+        noB.className = "btn";
+        noB.textContent = "Отмена";
+        var yesB = document.createElement("button");
+        yesB.type = "button";
+        yesB.className = "btn danger";
+        yesB.textContent = "Стереть";
+        function close() {
+          if (overlay.parentNode) {
+            overlay.parentNode.removeChild(overlay);
+          }
+        }
+        noB.addEventListener("click", close);
+        yesB.addEventListener("click", function () {
+          close();
+          try {
+            var stamps = listBackups();
+            stamps.forEach(function (stamp) {
+              safeSet(BACKUP_KEY_PREFIX + stamp, "");
+            });
+            safeSet(BACKUP_INDEX_KEY, "");
+            safeSet(STORE_KEY, "");
+            safeSet(DRAFT_KEY, "");
+            safeSet(UI_KEY, "");
+            config = normalize(DEFAULT_CONFIG);
+            saveConfig();
+            draft = normalize(JSON.parse(JSON.stringify(config)));
+            markDraftClean();
+            selectedTemplateId = draft.templates[0] ? draft.templates[0].id : "";
+            selectedVariableId = draft.customVariables[0] ? draft.customVariables[0].id : "";
+            dbCat = "people";
+            dbRecId = "";
+            renderLayout();
+            toast("Все данные стерты. Начат с пустого конфига.", "ok");
+          } catch (error) {
+            toast("Не удалось стереть данные: " + error, "err");
+          }
+        });
+        acts.appendChild(noB);
+        acts.appendChild(yesB);
+        box.appendChild(acts);
+        overlay.appendChild(box);
+        document.body.appendChild(overlay);
+      });
+      target.appendChild(wipeBtn);
 
       // Бэкапы (перенесены из «База данных»).
       var backupTitle = document.createElement("div");
@@ -6985,84 +7374,129 @@
       });
     }
 
-    // v0.2: вкладка «Справка» — все переменные и правила в одном месте.
+    // v0.3: «Справка» — структурированный справочник всех {{ }} конструкций.
+    // Клик по конструкции копирует её в буфер обмена.
     function renderHelpTab(target) {
       var title = document.createElement("div");
       title.className = "section-title";
-      title.textContent = "Справка";
+      title.textContent = "Справочник";
       target.appendChild(title);
 
-      var howto = document.createElement("div");
-      howto.className = "help muted";
-      howto.innerHTML =
-        "Как использовать: введите <code>" +
-        escapeHtml(draft.triggerPrefix) +
-        "tag</code> + пробел в любом поле ввода. Также <code>/буква</code> — быстрый список тегов. " +
-        "Для папок и навигации используйте <code>//</code>.<br>" +
-        "Домены шаблона: пусто = из настроек папки (⚙️), там пусто = на всех сайтах. Например <code>t.me</code> = t.me и все поддомены.";
-      target.appendChild(howto);
+      var intro = document.createElement("p");
+      intro.className = "muted";
+      intro.textContent = "Кликните по любой конструкции — она скопируется в буфер обмена.";
+      target.appendChild(intro);
 
-      var varsTitle = document.createElement("div");
-      varsTitle.className = "section-title";
-      varsTitle.style.marginTop = "14px";
-      varsTitle.textContent = "Стандартные переменные";
-      target.appendChild(varsTitle);
+      function refCard(cardTitle, note, rows) {
+        var card = document.createElement("div");
+        card.className = "ref-card";
+        var h = document.createElement("div");
+        h.className = "ref-title";
+        h.textContent = cardTitle;
+        card.appendChild(h);
+        if (note) {
+          var n = document.createElement("div");
+          n.className = "ref-note";
+          n.textContent = note;
+          card.appendChild(n);
+        }
+        rows.forEach(function (row) {
+          var line = document.createElement("div");
+          line.className = "ref-row";
+          var code = document.createElement("code");
+          code.textContent = row[0];
+          code.title = "Клик — скопировать";
+          code.style.cursor = "pointer";
+          code.addEventListener("click", function () {
+            copyTextToClipboard(row[0], "Скопируйте конструкцию");
+            toast("Скопировано: " + row[0], "ok");
+          });
+          var d = document.createElement("span");
+          d.className = "d";
+          d.textContent = row[1];
+          line.appendChild(code);
+          line.appendChild(d);
+          card.appendChild(line);
+        });
+        target.appendChild(card);
+      }
 
-      var varsHelp = document.createElement("div");
-      varsHelp.className = "help muted";
-      varsHelp.innerHTML =
-        "<code>{{name}}</code> - имя человека.<br>" +
-        "<code>{{surname}}</code> - фамилия человека.<br>" +
-        "<code>{{fullname}}</code> - имя + фамилия.<br>" +
-        "<code>{{company}}</code> - компания человека.<br>" +
-        "<code>{{email}}</code> - email человека.<br>" +
-        "<code>{{phone}}</code> - телефон человека.<br>" +
-        "<code>{{position}}</code> - должность человека.<br>" +
-        "<code>{{name:тег}}</code> - поле конкретного человека по тегу (например {{name:david}}). Без тега — активный.<br>" +
-        "<code>{{поле:тег}}</code> - поле записи: {{telegram:david}} — у конкретного; {{telegram}} без тега — у активной записи категории-владельца (люди — активный человек).<br>" +
-        "<code>{{поле:тег}}</code> - также записи справочников: {{телефон:acme}}. Человек с тем же тегом первичнее.<br>" +
-        "<code>{{поле:#}}</code> - выбор при вставке: {{name:#}} покажет все имена (люди + справочники), {{telegram:#}} — все telegram.<br>" +
-        "Выборка строго по имени поля: телефоны людей — {{phone:#}}, поле справочника «телефон» — {{телефон:#}}.<br>" +
-        "<code>{{поле:#группа}}</code> - СВЯЗАННАЯ выборка (выборочно): {{name:#кл}} + {{phone:#кл}} — выбрал запись один раз, остальные поля подтянулись сами.<br>" +
-        "<code>{{date}}</code> - дата №1 (один выбор для всех {{date}} / {{date+N}}).<br>" +
-        "<code>{{date+N}}</code> / <code>{{date-N}}</code> - сдвиг в днях от даты №1.<br>" +
-        "<code>{{date2}}</code> / <code>{{date2+N}}</code> - НЕЗАВИСИМАЯ дата №2 (свой выбор). Так же date3..date9.<br>" +
-        "<code>{{date(\"Подпись\")}}</code> / <code>{{date+7(\"Подпись\")}}</code> - дата с подписью: в окне вставки вместо тега видно «Подпись», повтор той же подписи считает от той же даты.<br>" +
-        "<code>{{datetoday}}</code> - всегда сегодняшняя дата (не спрашивает).<br>" +
-        "<code>{{datetoday+N}}</code> / <code>{{datetoday-N}}</code> - сдвиг от сегодняшней даты.<br>" +
-        "<code>{{time}}</code> - время №1 (один выбор для всех {{time*}}).<br>" +
-        "<code>{{time+N}}</code> / <code>{{time-N}}</code> - сдвиг в часах от времени №1.<br>" +
-        "<code>{{time2}}</code> / <code>{{time2+N}}</code> - НЕЗАВИСИМОЕ время №2. Так же time3..time9.<br>" +
-        "<code>{{time(\"Подпись\")}}</code> - время с подписью, заполняется прямо в тексте.<br>" +
-        "<code>{{var(\"Подсказка\")}}</code> - своя переменная с подписью: в окне вставки видно «Подсказка».<br>" +
-        "<code>{{timetoday}}</code> - всегда текущее время (не спрашивает).<br>" +
-        "<code>{{timetoday+N}}</code> / <code>{{timetoday-N}}</code> - сдвиг от текущего времени.<br>" +
-        "<code>{{text}}</code> / {{text2}} / {{text(\"Подпись\")}} - свободный ввод с клавиатуры при вставке (обязательный).<br>" +
-        "<code>{{pick:a|b|c}}</code> - случайный вариант.<br>" +
-        "<code>{{upper:text}}</code> - верхний регистр.<br>" +
-        "<code>{{lower:TEXT}}</code> - нижний регистр.<br>" +
-        "<code>{{calc:expr}}</code> - математика (+ - * / % скобки).";
-      target.appendChild(varsHelp);
+      var menuHk = hotkeyLabel(draft.hotkeyMenu);
 
-      var cvTitle = document.createElement("div");
-      cvTitle.className = "section-title";
-      cvTitle.style.marginTop = "14px";
-      cvTitle.textContent = "Пользовательские переменные";
-      target.appendChild(cvTitle);
+      refCard("Вставка шаблонов", "Работает в любом поле ввода на любом сайте.", [
+        [draft.triggerPrefix + "tag", "введите префикс и тег шаблона + пробел — текст вставится"],
+        [draft.triggerPrefix + "буква", "быстрый список шаблонов, начинающихся на эту букву"],
+        ["//", "дерево папок и навигация по шаблонам"],
+        [menuHk || "хоткей выключен", "открыть меню шаблонов для текущего поля (настраивается во вкладке «Настройки»)"]
+      ]);
 
-      var cvHelp = document.createElement("div");
-      cvHelp.className = "help muted";
-      cvHelp.innerHTML =
-        "<b>Что можно использовать в значении переменной:</b><br>" +
-        "<code>{{name}}</code>, <code>{{surname}}</code>, <code>{{fullname}}</code>, <code>{{company}}</code>, <code>{{position}}</code>, <code>{{email}}</code>, <code>{{phone}}</code>.<br>" +
-        "Все семь берутся из активной записи категории-владельца (База данных; человека при вставке можно выбрать другого).<br>" +
-        "<code>{{date}}</code>, <code>{{date+N}}</code>, <code>{{date-N}}</code>.<br>" +
-        "<code>{{datetoday}}</code>, <code>{{datetoday+N}}</code>, <code>{{datetoday-N}}</code>.<br>" +
-        "<code>{{time}}</code>, <code>{{time+N}}</code>, <code>{{time-N}}</code>.<br>" +
-        "<code>{{timetoday}}</code>, <code>{{timetoday+N}}</code>, <code>{{timetoday-N}}</code>.<br>" +
-        "<code>{{pick:a|b|c}}</code>, <code>{{upper:text}}</code>, <code>{{lower:TEXT}}</code>.<br>" +
-        "<code>{{calc:expr}}</code> - формулы для расчетов (например <code>{{calc:summa*0.2}}</code>).";
-      target.appendChild(cvHelp);
+      refCard("Данные человека и записей", "Без тега — активная запись категории-владельца. С тегом — конкретная запись. Человек с тем же тегом первичнее записи справочника.", [
+        ["{{name}}", "имя"],
+        ["{{surname}}", "фамилия"],
+        ["{{fullname}}", "имя + фамилия"],
+        ["{{company}}", "компания"],
+        ["{{position}}", "должность"],
+        ["{{email}}", "email"],
+        ["{{phone}}", "телефон"],
+        ["{{имя_поля}}", "любое своё поле записи БД: {{telegram}}, {{договор}}"],
+        ["{{имя_поля:тег}}", "то же поле у конкретной записи: {{telegram:david}}, {{договор:acme}}"]
+      ]);
+
+      refCard("Выбор при вставке", "# = выбрать значение из существующих прямо в окне вставки. Выборка строго по имени поля: телефоны людей — {{phone:#}}, поле справочника «телефон» — {{телефон:#}}.", [
+        ["{{поле:#}}", "выбрать из всех значений этого поля: {{name:#}}, {{telegram:#}}"],
+        ["{{поле:#группа}}", "связанная выборка: {{name:#кл}} + {{phone:#кл}} — выбрали запись один раз, остальные поля подтянулись сами"],
+        ["{{phone:#}}", "все телефоны людей"],
+        ["{{телефон:#}}", "поле «телефон» из справочников"]
+      ]);
+
+      refCard("Даты", "Даты с одним номером делят выбор: {{date}} и {{date+3}} спросят один раз. Свой номер = независимая дата.", [
+        ["{{date}}", "дата №1 — спросит при вставке"],
+        ["{{date+3}} / {{date-3}}", "сдвиг в днях от даты №1"],
+        ["{{date2}}", "НЕЗАВИСИМАЯ дата №2 — спросит отдельно. Так же date3..date9"],
+        ["{{date2+7}}", "сдвиг от даты №2"],
+        ['{{date("Подпись")}}', "дата с подписью: в окне вставки видно «Подпись» вместо тега"],
+        ['{{date+7("Подпись")}}', "дата №1 + 7 дней с подписью; та же подпись = та же базовая дата"],
+        ["{{datetoday}}", "сегодняшняя дата — не спрашивает"],
+        ["{{datetoday+2}} / {{datetoday-2}}", "сегодня ± 2 дня"]
+      ]);
+
+      refCard("Время", "Аналогично датам: один номер — один выбор, независимые номера — отдельные выборы.", [
+        ["{{time}}", "время №1 — спросит при вставке"],
+        ["{{time+2}} / {{time-2}}", "сдвиг в часах от времени №1"],
+        ["{{time2}}", "НЕЗАВИСИМОЕ время №2. Так же time3..time9"],
+        ['{{time("Время встречи")}}', "время с подписью, заполняется прямо в тексте"],
+        ["{{timetoday}}", "текущее время — не спрашивает"],
+        ["{{timetoday-1}} / {{timetoday+1}}", "текущее время ± 1 час"]
+      ]);
+
+      refCard("Свободный ввод, функции, рандом", "", [
+        ["{{text}}", "свободный ввод с клавиатуры при вставке (обязательный)"],
+        ["{{text2}}", "второй независимый свободный ввод"],
+        ['{{text("Комментарий")}}', "свободный ввод с подписью «Комментарий»"],
+        ['{{var("Подсказка")}}', "своя переменная с подписью: в окне вставки видно «Подсказка»"],
+        ["[[вариант 1|вариант 2|вариант 3]]", "случайный вариант при каждой вставке"],
+        ["{{pick:а|б|в}}", "случайный вариант внутри конструкции"],
+        ["{{upper:текст}}", "ВЕРХНИЙ РЕГИСТР"],
+        ["{{lower:ТЕКСТ}}", "нижний регистр"],
+        ["{{calc:выражение}}", "математика: + - * / % скобки, например {{calc:1200*0.2}}"]
+      ]);
+
+      refCard("Свои переменные", "Создаются во вкладке «Переменные». Внутри значения переменной можно использовать любые конструкции из этого справочника — они разберутся при вставке.", [
+        ["{{promo_word}}", "своя переменная по имени — просто {{имя_переменной}}"],
+        ["{{date+3}}", "внутри переменной тоже работает"],
+        ["{{name}}", "и данные из БД тоже"]
+      ]);
+
+      refCard("Где работает шаблон", "Пусто у шаблона = берётся из настроек папки (⚙️ рядом с папкой), у папки пусто = на всех сайтах.", [
+        ["t.me", "домен в списке = t.me и все поддомены"],
+        ["⚙️ у папки", "название папки, режим (все сайты / только эти / кроме этих), домены и иконка"]
+      ]);
+
+      refCard("Полезно знать", "", [
+        ["Ctrl+S", "сохранить черновик (предыдущая версия уходит в бэкапы)"],
+        ["Превью", "кнопка «Предпросмотр перед вставкой» у шаблона — окно подтверждения перед вставкой"],
+        ["Песочница", "вкладка «Переменные» — проверьте любое выражение, не выходя из настроек"]
+      ]);
     }
 
     // v3.2.0: хоткеи настроек — Ctrl+S сохранить, "/" в поиск шаблонов.
@@ -7115,7 +7549,7 @@
 
     // ---------- v0.2: тосты вместо alert + запуск защиты черновика ----------
     var toastBox = null;
-    function toast(message, kind) {
+    function toast(message, kind, action) {
       try {
         if (!toastBox || !toastBox.parentNode) {
           toastBox = document.createElement("div");
@@ -7129,14 +7563,30 @@
         el.style.cssText =
           "background:" + bg + ";color:#f3f4f6;border:1px solid " + border + ";border-radius:8px;" +
           "padding:10px 14px;font-size:14px;max-width:380px;box-shadow:0 8px 24px rgba(0,0,0,0.4);" +
-          "white-space:pre-line;";
-        el.textContent = String(message || "");
+          "white-space:pre-line;display:flex;gap:10px;align-items:center;";
+        var textSpan = document.createElement("span");
+        textSpan.style.flex = "1";
+        textSpan.textContent = String(message || "");
+        el.appendChild(textSpan);
+        if (action && action.label && typeof action.fn === "function") {
+          var actBtn = document.createElement("button");
+          actBtn.type = "button";
+          actBtn.className = "btn";
+          actBtn.textContent = action.label;
+          actBtn.addEventListener("click", function () {
+            action.fn();
+            if (el.parentNode) {
+              el.parentNode.removeChild(el);
+            }
+          });
+          el.appendChild(actBtn);
+        }
         toastBox.appendChild(el);
         window.setTimeout(function () {
           if (el.parentNode) {
             el.parentNode.removeChild(el);
           }
-        }, 4000);
+        }, action ? 8000 : 4000);
       } catch (error) {
         /* ignore */
       }
