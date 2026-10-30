@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TextEnter - Templates and Quick Replies
 // @namespace    https://textenter.local/
-// @version      0.1
+// @version      0.2
 // @description  Message templates, tags, // menu, custom variables, tagged people profiles, backups, and isolated settings workspace
 // @author       TextEnter Studio
 // @license      MIT
@@ -509,6 +509,8 @@
       typingDelay: Math.max(0, Number(source.typingDelay) || 0),
       triggerPrefix: typeof source.triggerPrefix === "string" && source.triggerPrefix ? source.triggerPrefix : "/",
       attachImages: source.attachImages !== false,
+      hotkeyMenu: typeof source.hotkeyMenu === "string" ? source.hotkeyMenu : "ctrl+shift+k",
+      hotkeySettings: typeof source.hotkeySettings === "string" ? source.hotkeySettings : "ctrl+shift+l",
       profile: legacyProfile,
       profiles: profiles,
       activeProfileId: activeProfileId,
@@ -878,15 +880,73 @@
     input.click();
   }
 
-  function handleGlobalHotkeys(event) {
-    // v3.1.0: Ctrl/Cmd+Shift+K = открыть/сфокусировать меню, Ctrl/Cmd+Shift+L = настройки.
-    try {
-      var mod = event.ctrlKey || event.metaKey;
-      if (!mod || !event.shiftKey) {
-        return;
+  // v0.2: хоткеи настраиваемые (Настройки → «Настройки» вкладка).
+  // Формат: модификаторы через "+", например "ctrl+shift+k". Пусто = хоткей выключен.
+  function hotkeyParts(spec) {
+    var parts = { ctrl: false, shift: false, alt: false, key: "" };
+    String(spec || "").toLowerCase().split("+").forEach(function (p) {
+      var token = String(p || "").trim();
+      if (token === "ctrl" || token === "control" || token === "cmd") {
+        parts.ctrl = true;
+      } else if (token === "shift") {
+        parts.shift = true;
+      } else if (token === "alt") {
+        parts.alt = true;
+      } else if (token) {
+        parts.key = token;
       }
-      var key = String(event.key || "").toLowerCase();
-      if (key === "k" || key === "л") {
+    });
+    return parts;
+  }
+
+  function hotkeyMatches(spec, event) {
+    var parts = hotkeyParts(spec);
+    if (!parts.key) {
+      return false;
+    }
+    var mod = event.ctrlKey || event.metaKey;
+    if (parts.ctrl !== mod) {
+      return false;
+    }
+    if (parts.shift !== event.shiftKey) {
+      return false;
+    }
+    if (parts.alt !== event.altKey) {
+      return false;
+    }
+    var key = String(event.key || "").toLowerCase();
+    // русская раскладка: сравниваем и по event.code (KeyK -> "k")
+    var codeKey = "";
+    var codeMatch = /^Key([A-Z])$/.exec(String(event.code || ""));
+    if (codeMatch) {
+      codeKey = codeMatch[1].toLowerCase();
+    }
+    return key === parts.key || codeKey === parts.key;
+  }
+
+  function hotkeyLabel(spec) {
+    var parts = hotkeyParts(spec);
+    if (!parts.key) {
+      return "";
+    }
+    var out = [];
+    if (parts.ctrl) {
+      out.push("Ctrl");
+    }
+    if (parts.alt) {
+      out.push("Alt");
+    }
+    if (parts.shift) {
+      out.push("Shift");
+    }
+    out.push(parts.key.toUpperCase());
+    return out.join("+");
+  }
+
+  function handleGlobalHotkeys(event) {
+    // v0.2: хоткеи из конфига (по умолчанию Ctrl+Shift+K меню, Ctrl+Shift+L настройки).
+    try {
+      if (hotkeyMatches(config.hotkeyMenu, event)) {
         var field = event.target;
         if (!isField(field)) {
           field = document.activeElement && isField(document.activeElement) ? document.activeElement : null;
@@ -896,13 +956,13 @@
           event.stopPropagation();
           openFolderMenu(field, "", caretPosition(field), "");
         }
-      } else if (key === "l" || key === "д") {
+      } else if (hotkeyMatches(config.hotkeySettings, event)) {
         event.preventDefault();
         event.stopPropagation();
         openSettingsPage();
       }
     } catch (error) {
-      /* ignore */
+      debugLog("handleGlobalHotkeys: failed", error);
     }
   }
 
@@ -3328,7 +3388,8 @@
     var footer = document.createElement("div");
     footer.className = "foot";
     var hint = document.createElement("span");
-    hint.textContent = "ESC — закрыть · Ctrl+Shift+K — меню · ↑↓ — выбор";
+    var menuHk = hotkeyLabel(config.hotkeyMenu);
+    hint.textContent = "ESC — закрыть · " + (menuHk ? menuHk + " — меню · " : "") + "↑↓ — выбор";
     footer.appendChild(hint);
     menuEl.appendChild(footer);
 
@@ -3645,6 +3706,111 @@
     var dbRecId = "";
     var dbRenamingCat = null;
 
+    // ---------- v0.2: защита черновика ----------
+    // Черновик автосохраняется в GM-хранилище (каждые 15с и перед закрытием вкладки),
+    // чтобы случайное закрытие настроек не теряло правки. При следующем открытии
+    // показываем баннер «Восстановить / Отклонить».
+    var DRAFT_KEY = "textenter_draft_v1";
+    var savedDraftSnapshot = "";
+    var draftBanner = null;
+    try {
+      savedDraftSnapshot = JSON.stringify(draft);
+    } catch (error) {
+      savedDraftSnapshot = "";
+    }
+
+    function isDraftDirty() {
+      try {
+        return JSON.stringify(draft) !== savedDraftSnapshot;
+      } catch (error) {
+        return false;
+      }
+    }
+
+    function markDraftClean() {
+      try {
+        savedDraftSnapshot = JSON.stringify(draft);
+      } catch (error) { /* ignore */ }
+      safeSet(DRAFT_KEY, "");
+    }
+
+    function saveDraftSnapshot() {
+      try {
+        if (isDraftDirty()) {
+          safeSet(DRAFT_KEY, JSON.stringify({ at: new Date().toISOString(), data: draft }));
+        }
+      } catch (error) {
+        debugLog("saveDraftSnapshot: failed", error);
+      }
+    }
+
+    function dismissDraftBanner() {
+      if (draftBanner && draftBanner.parentNode) {
+        draftBanner.parentNode.removeChild(draftBanner);
+      }
+      draftBanner = null;
+    }
+
+    function showDraftRestoreBanner(saved) {
+      dismissDraftBanner();
+      draftBanner = document.createElement("div");
+      draftBanner.style.cssText =
+        "position:fixed;top:0;left:0;right:0;z-index:2147483647;display:flex;gap:12px;align-items:center;" +
+        "justify-content:center;padding:10px 16px;background:#3b2f10;color:#fde68a;border-bottom:1px solid #f59e0b;font-size:14px;";
+      var when = String(saved.at || "").replace("T", " ").slice(0, 19);
+      var msg = document.createElement("span");
+      msg.textContent = "Найден несохранённый черновик" + (when ? " от " + when : "") + ".";
+      var restoreBtn = document.createElement("button");
+      restoreBtn.type = "button";
+      restoreBtn.className = "btn";
+      restoreBtn.textContent = "Восстановить";
+      restoreBtn.addEventListener("click", function () {
+        try {
+          draft = normalize(saved.data);
+          selectedTemplateId = draft.templates[0] ? draft.templates[0].id : "";
+          selectedVariableId = draft.customVariables[0] ? draft.customVariables[0].id : "";
+          dbCat = "people";
+          dbRecId = "";
+          dbRenamingCat = null;
+          selectedIds = {};
+          markDraftClean();
+          toast("Черновик восстановлен", "ok");
+          renderLayout();
+        } catch (error) {
+          toast("Не удалось восстановить черновик: " + error, "err");
+        }
+        dismissDraftBanner();
+      });
+      var discardBtn = document.createElement("button");
+      discardBtn.type = "button";
+      discardBtn.className = "btn danger";
+      discardBtn.textContent = "Отклонить";
+      discardBtn.addEventListener("click", function () {
+        safeSet(DRAFT_KEY, "");
+        dismissDraftBanner();
+      });
+      draftBanner.appendChild(msg);
+      draftBanner.appendChild(restoreBtn);
+      draftBanner.appendChild(discardBtn);
+      document.body.appendChild(draftBanner);
+    }
+
+    function checkSavedDraft() {
+      try {
+        var raw = safeGet(DRAFT_KEY, "");
+        if (!raw) {
+          return;
+        }
+        var saved = JSON.parse(raw);
+        if (saved && saved.data && Array.isArray(saved.data.templates)) {
+          showDraftRestoreBanner(saved);
+        }
+      } catch (error) {
+        debugLog("checkSavedDraft: failed", error);
+      }
+    }
+    // ---------- конец защиты черновика ----------
+
     function folderListFrom(source) {
       var set = { "Общие": true };
       (source.folders || []).forEach(function (item) {
@@ -3690,6 +3856,7 @@
       config = normalize(JSON.parse(JSON.stringify(draft)));
       saveConfig();
       draft = normalize(JSON.parse(JSON.stringify(config)));
+      markDraftClean(); // v0.2: сброс автосохранения черновика
     }
 
     // ---------- v3.2.0: бэкапы, файл-импорт, шаринг, валидация ----------
@@ -3700,7 +3867,7 @@
       try {
         var raw = safeGet(BACKUP_KEY_PREFIX + stamp, "");
         if (!raw) {
-          window.alert("Бэкап не найден");
+          toast("Бэкап не найден");
           return;
         }
         backupCurrentConfig();
@@ -3710,11 +3877,170 @@
         dbCat = "people";
         dbRecId = "";
         dbRenamingCat = null;
-        window.alert("Бэкап " + stamp + " загружен в черновик. Нажмите Сохранить, чтобы применить.");
+        markDraftClean(); // v0.2
+        toast("Бэкап " + stamp + " загружен в черновик. Нажмите Сохранить, чтобы применить.");
         renderLayout();
       } catch (error) {
-        window.alert("Не удалось восстановить бэкап: " + error);
+        toast("Не удалось восстановить бэкап: " + error);
       }
+    }
+
+    function applyDraftReplacement(next) {
+      // Черновик после замены — несохранённые изменения: снапшот не трогаем,
+      // isDraftDirty() вернет true и автосейв защитит данные.
+      draft = next;
+      selectedTemplateId = draft.templates[0] ? draft.templates[0].id : "";
+      selectedVariableId = draft.customVariables[0] ? draft.customVariables[0].id : "";
+      dbCat = "people";
+      dbRecId = "";
+      dbRenamingCat = null;
+      selectedIds = {};
+      renderLayout();
+    }
+
+    function mergeDraftData(incoming) {
+      // Шаблоны: добавляем, дубли тегов переименовываем (как в шаринг-ссылках).
+      var taken = {};
+      draft.templates.forEach(function (t) {
+        taken[tagKey(t.tag)] = true;
+      });
+      incoming.templates.forEach(function (item) {
+        var clean = normalize({ templates: [item], folders: [], folderPreferences: [], customVariables: [] }).templates[0];
+        if (!clean) {
+          return;
+        }
+        clean.id = "tpl-" + Date.now() + "-" + draft.templates.length;
+        if (clean.tag && taken[tagKey(clean.tag)]) {
+          var i = 2;
+          while (taken[tagKey(clean.tag) + i]) {
+            i += 1;
+          }
+          clean.tag = tagKey(clean.tag) + i;
+        }
+        if (clean.tag) {
+          taken[tagKey(clean.tag)] = true;
+        }
+        draft.templates.push(clean);
+      });
+      // Папки: объединение с сохранением порядка.
+      (incoming.folders || []).forEach(function (f) {
+        if (f && draft.folders.indexOf(f) === -1) {
+          draft.folders.push(f);
+        }
+      });
+      // Переменные: по имени.
+      var varNames = {};
+      draft.customVariables.forEach(function (v) {
+        varNames[String(v.name || "").toLowerCase()] = true;
+      });
+      (incoming.customVariables || []).forEach(function (v) {
+        if (v && v.name && !varNames[String(v.name).toLowerCase()]) {
+          var copy = JSON.parse(JSON.stringify(v));
+          copy.id = "var-" + Date.now() + "-" + draft.customVariables.length;
+          draft.customVariables.push(copy);
+          varNames[String(v.name).toLowerCase()] = true;
+        }
+      });
+      // Записи: категории по имени, записи внутри — по тегу.
+      (incoming.recordSets || []).forEach(function (set) {
+        if (!set || !set.name) {
+          return;
+        }
+        var existing = draft.recordSets.filter(function (s) {
+          return s.name === set.name;
+        })[0];
+        if (!existing) {
+          draft.recordSets.push(JSON.parse(JSON.stringify(set)));
+          return;
+        }
+        existing.fields = existing.fields || [];
+        var fieldNames = {};
+        existing.fields.forEach(function (f) {
+          fieldNames[f.name] = true;
+        });
+        (set.fields || []).forEach(function (f) {
+          if (f && f.name && !fieldNames[f.name]) {
+            existing.fields.push(JSON.parse(JSON.stringify(f)));
+            fieldNames[f.name] = true;
+          }
+        });
+        existing.records = existing.records || [];
+        var recTags = {};
+        existing.records.forEach(function (r) {
+          recTags[r.tag || r.id] = true;
+        });
+        (set.records || []).forEach(function (r) {
+          if (r && !recTags[r.tag || r.id]) {
+            existing.records.push(JSON.parse(JSON.stringify(r)));
+            recTags[r.tag || r.id] = true;
+          }
+        });
+      });
+    }
+
+    function askImportMode(parsed, onDone) {
+      // v0.2: выбор режима импорта вместо безусловной замены черновика.
+      var overlay = document.createElement("div");
+      overlay.style.cssText =
+        "position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.6);display:flex;" +
+        "align-items:center;justify-content:center;";
+      var box = document.createElement("div");
+      box.style.cssText =
+        "background:#111827;border:1px solid #374151;border-radius:10px;padding:20px;max-width:440px;width:90%;color:#e5e7eb;";
+      var title = document.createElement("div");
+      title.style.fontWeight = "600";
+      title.style.marginBottom = "8px";
+      title.textContent = "Импорт JSON";
+      var desc = document.createElement("div");
+      desc.className = "muted";
+      desc.style.marginBottom = "14px";
+      desc.textContent =
+        "В файле: шаблонов — " + (parsed.templates || []).length +
+        ", переменных — " + (parsed.customVariables || []).length +
+        ", категорий записей — " + (parsed.recordSets || []).length + ".";
+      var actions = document.createElement("div");
+      actions.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;";
+      var replaceBtn = document.createElement("button");
+      replaceBtn.type = "button";
+      replaceBtn.className = "btn danger";
+      replaceBtn.textContent = "Заменить всё";
+      var mergeBtn = document.createElement("button");
+      mergeBtn.type = "button";
+      mergeBtn.className = "btn";
+      mergeBtn.textContent = "Объединить";
+      var cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.className = "btn";
+      cancelBtn.textContent = "Отмена";
+      function close() {
+        if (overlay.parentNode) {
+          overlay.parentNode.removeChild(overlay);
+        }
+      }
+      replaceBtn.addEventListener("click", function () {
+        close();
+        applyDraftReplacement(normalize(JSON.parse(JSON.stringify(parsed))));
+        toast("Импортировано с заменой. Нажмите Сохранить, чтобы применить.", "ok");
+      });
+      mergeBtn.addEventListener("click", function () {
+        close();
+        try {
+          mergeDraftData(normalize(JSON.parse(JSON.stringify(parsed))));
+          renderLayout();
+          toast("Объединено. Нажмите Сохранить, чтобы применить.", "ok");
+        } catch (error) {
+          toast("Не удалось объединить: " + error, "err");
+        }
+      });
+      cancelBtn.addEventListener("click", close);
+      actions.appendChild(cancelBtn);
+      actions.appendChild(mergeBtn);
+      actions.appendChild(replaceBtn);
+      box.appendChild(title);
+      box.appendChild(desc);
+      box.appendChild(actions);
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
     }
 
     function importToDraftRaw(raw) {
@@ -3722,17 +4048,10 @@
         return;
       }
       try {
-        draft = normalize(JSON.parse(raw));
-        selectedTemplateId = draft.templates[0] ? draft.templates[0].id : "";
-        selectedVariableId = draft.customVariables[0] ? draft.customVariables[0].id : "";
-        dbCat = "people";
-        dbRecId = "";
-        dbRenamingCat = null;
-        selectedIds = {};
-        window.alert("JSON загружен в черновик. Нажмите Сохранить, чтобы применить.");
-        renderLayout();
+        var parsed = normalize(JSON.parse(raw));
+        askImportMode(parsed);
       } catch (error) {
-        window.alert("Неверный JSON: " + error);
+        toast("Неверный JSON: " + error, "err");
       }
     }
 
@@ -3806,9 +4125,9 @@
         var code = base64UrlEncode(JSON.stringify(payload));
         var link = window.location.origin + window.location.pathname + "#textenter=" + code;
         copyTextToClipboard(link, "Скопируйте ссылку на шаблоны");
-        window.alert("Ссылка на " + payload.length + " шаблон(ов) скопирована. Получатель: Настройки → Импорт JSON → вставить ссылку.");
+        toast("Ссылка на " + payload.length + " шаблон(ов) скопирована. Получатель: Настройки → Импорт JSON → вставить ссылку.");
       } catch (error) {
-        window.alert("Не удалось создать ссылку: " + error);
+        toast("Не удалось создать ссылку: " + error);
       }
     }
 
@@ -3855,13 +4174,13 @@
             added += 1;
           });
           selectedTemplateId = draft.templates[0] ? draft.templates[0].id : "";
-          window.alert("Импортировано шаблонов: " + added + ". Нажмите Сохранить.");
+          toast("Импортировано шаблонов: " + added + ". Нажмите Сохранить.");
           renderLayout();
           return;
         }
         importToDraftRaw(text);
       } catch (error) {
-        window.alert("Неверная ссылка или JSON: " + error);
+        toast("Неверная ссылка или JSON: " + error);
       }
     }
 
@@ -3991,7 +4310,7 @@
       var text = JSON.stringify(draft, null, 2);
       copyTextToClipboard(text, "Скопируйте JSON-конфиг TextEnter");
       downloadJsonFile("textenter-config.json", text);
-      window.alert("Черновик скопирован в буфер обмена и скачан как файл textenter-config.json");
+      toast("Черновик скопирован в буфер обмена и скачан как файл textenter-config.json");
     }
 
     function renderLayout(restoreSearch) {
@@ -4104,7 +4423,7 @@
       saveBtn.title = "Сохранить черновик. Текущий конфиг уйдет в бэкап.";
       saveBtn.addEventListener("click", function () {
         persistDraftToConfig();
-        window.alert("Изменения сохранены, предыдущая версия — в бэкапах (База данных)");
+        toast("Изменения сохранены, предыдущая версия — в бэкапах (вкладка «Настройки»)", "ok");
         renderLayout();
       });
 
@@ -4142,6 +4461,7 @@
         dbRecId = "";
         dbRenamingCat = null;
         selectedIds = {};
+        markDraftClean(); // v0.2
         renderLayout();
       });
 
@@ -4168,15 +4488,19 @@
           return n + ((s.records || []).length);
         }, 0)
       };
+      // v0.2: настройки и справка вынесены в отдельные вкладки.
       [
         { id: "templates", label: "Шаблоны" },
         { id: "variables", label: "Переменные" },
-        { id: "general", label: "База данных" }
+        { id: "general", label: "База данных" },
+        { id: "settings", label: "Настройки" },
+        { id: "help", label: "Справка" }
       ].forEach(function (tab) {
         var btn = document.createElement("button");
         btn.type = "button";
         btn.className = activeTab === tab.id ? "nav-btn active" : "nav-btn";
-        btn.textContent = tab.label + " (" + (navCounts[tab.id] || 0) + ")";
+        var label = tab.label + (navCounts[tab.id] !== undefined ? " (" + navCounts[tab.id] + ")" : "");
+        btn.textContent = label;
         btn.addEventListener("click", function () {
           activeTab = tab.id;
           renderLayout();
@@ -4193,8 +4517,12 @@
         renderTemplatesTab(content);
       } else if (activeTab === "variables") {
         renderVariablesTab(content);
+      } else if (activeTab === "settings") {
+        renderSettingsTab(content);
+      } else if (activeTab === "help") {
+        renderHelpTab(content);
       } else {
-        // v3.8.0: вкладки Общие и Справочники слиты — люди, поля, справочники, прочее и бэкапы в одном месте.
+        // v3.8.0: вкладки Общие и Справочники слиты — люди, поля, справочники в одном месте.
         renderGeneralTab(content);
       }
 
@@ -4218,40 +4546,7 @@
     }
 
     function renderTemplatesTab(target) {
-      var variablesGuide =
-        "<b>Стандартные переменные:</b><br>" +
-        "<code>{{name}}</code> - имя человека.<br>" +
-        "<code>{{surname}}</code> - фамилия человека.<br>" +
-        "<code>{{fullname}}</code> - имя + фамилия.<br>" +
-        "<code>{{company}}</code> - компания человека.<br>" +
-        "<code>{{email}}</code> - email человека.<br>" +
-        "<code>{{phone}}</code> - телефон человека.<br>" +
-        "<code>{{position}}</code> - должность человека.<br>" +
-        "<code>{{name:тег}}</code> - поле конкретного человека по тегу (например {{name:david}}). Без тега — активный.<br>" +
-        "<code>{{поле:тег}}</code> - поле записи: {{telegram:david}} — у конкретного; {{telegram}} без тега — у активной записи категории-владельца (люди — активный человек).<br>" +
-        "<code>{{поле:тег}}</code> - также записи справочников (вкладка Справочники): {{телефон:acme}}. Человек с тем же тегом первичнее.<br>" +
-        "<code>{{поле:#}}</code> - выбор при вставке: {{name:#}} покажет все имена (люди + справочники), {{telegram:#}} — все telegram.<br>" +
-        "Выборка строго по имени поля: телефоны людей — {{phone:#}}, поле справочника «телефон» — {{телефон:#}}.<br>" +
-        "<code>{{поле:#группа}}</code> - СВЯЗАННАЯ выборка (выборочно): {{name:#кл}} + {{phone:#кл}} — выбрал запись один раз, остальные поля подтянулись сами.<br>" +
-        "<code>{{date}}</code> - дата №1 (один выбор для всех {{date}} / {{date+N}}).<br>" +
-        "<code>{{date+N}}</code> / <code>{{date-N}}</code> - сдвиг в днях от даты №1.<br>" +
-        "<code>{{date2}}</code> / <code>{{date2+N}}</code> - НЕЗАВИСИМАЯ дата №2 (свой выбор). Так же date3..date9.<br>" +
-        "<code>{{date(\"Подпись\")}}</code> / <code>{{date+7(\"Подпись\")}}</code> - дата с подписью: в окне вставки вместо тега видно «Подпись», повтор той же подписи считает от той же даты.<br>" +
-        "<code>{{datetoday}}</code> - всегда сегодняшняя дата (не спрашивает).<br>" +
-        "<code>{{datetoday+N}}</code> / <code>{{datetoday-N}}</code> - сдвиг от сегодняшней даты.<br>" +
-        "<code>{{time}}</code> - время №1 (один выбор для всех {{time*}}).<br>" +
-        "<code>{{time+N}}</code> / <code>{{time-N}}</code> - сдвиг в часах от времени №1.<br>" +
-        "<code>{{time2}}</code> / <code>{{time2+N}}</code> - НЕЗАВИСИМОЕ время №2. Так же time3..time9.<br>" +
-        "<code>{{time(\"Подпись\")}}</code> - время с подписью, заполняется прямо в тексте.<br>" +
-        "<code>{{var(\"Подсказка\")}}</code> - своя переменная с подписью: в окне вставки видно «Подсказка».<br>" +
-        "<code>{{timetoday}}</code> - всегда текущее время (не спрашивает).<br>" +
-        "<code>{{timetoday+N}}</code> / <code>{{timetoday-N}}</code> - сдвиг от текущего времени.<br>" +
-        "<code>{{text}}</code> / {{text2}} / {{text(\"Подпись\")}} - свободный ввод с клавиатуры при вставке (обязательный).<br>" +
-        "<code>{{pick:a|b|c}}</code> - случайный вариант.<br>" +
-        "<code>{{upper:text}}</code> - верхний регистр.<br>" +
-        "<code>{{lower:TEXT}}</code> - нижний регистр.<br>" +
-        "<code>{{calc:expr}}</code> - математика (+ - * / % скобки).";
-
+      // v0.2: подробная справка по переменным перенесена во вкладку «Справка».
       target.innerHTML = '<div class="section-title">Шаблоны</div>';
 
       // v3.2.0: баннер валидации — клик по проблеме открывает шаблон.
@@ -4386,7 +4681,7 @@
             taken[clean] = true;
           }
         });
-        window.alert(
+        toast(
           "Готово: почищено " + fixed + ", дублей разведено " + renamed + ".\n" +
           "Пустые теги оставлены пустыми = только через //.\nНе забудьте нажать Сохранить."
         );
@@ -5666,10 +5961,19 @@
       help.innerHTML =
         'Как использовать: <code>' +
         escapeHtml(draft.triggerPrefix) +
-        'tag</code> + пробел. Также вводите <code>/буква</code> для быстрого списка тегов. Для папок и навигации по папкам используйте <code>//</code>.<br>' +
-        variablesGuide +
-        '<br>Домены шаблона: пусто = из настроек папки (⚙️), там пусто = на всех сайтах. Например <code>t.me</code> = t.me и все поддомены.';
+        'tag</code> + пробел. Также вводите <code>/буква</code> для быстрого списка тегов. Для папок используйте <code>//</code>.<br>' +
+        'Полный список переменных — во вкладке <b>Справка</b>.';
+      var helpLink = document.createElement("button");
+      helpLink.type = "button";
+      helpLink.className = "btn";
+      helpLink.style.marginTop = "8px";
+      helpLink.textContent = "Открыть справку";
+      helpLink.addEventListener("click", function () {
+        activeTab = "help";
+        renderLayout();
+      });
       target.appendChild(help);
+      target.appendChild(helpLink);
       // v3.10.0: модалка настроек папки поверх всего.
       renderFolderModal();
     }
@@ -6208,7 +6512,7 @@
           return;
         }
         if (desc.kind === "people" && dbRecords(desc).length <= 1) {
-          window.alert("Нужен хотя бы один человек.");
+          toast("Нужен хотя бы один человек.", "err");
           return;
         }
         if (!window.confirm("Удалить: " + dbDisplay(desc, cur) + "?")) {
@@ -6455,15 +6759,15 @@
       function commitNewDbField() {
         var clean = sanitizeProfileFieldName(newInput.value);
         if (!clean) {
-          window.alert("Имя поля: латиница/кириллица, цифры и подчеркивание.");
+          toast("Имя поля: латиница/кириллица, цифры и подчеркивание.", "err");
           return;
         }
         if (desc.kind === "people" && profileBuiltinFields().indexOf(clean) !== -1) {
-          window.alert("«" + clean + "» уже есть среди встроенных (name, phone, …) — отдельно добавлять не нужно.");
+          toast("«" + clean + "» уже есть среди встроенных (name, phone, …) — отдельно добавлять не нужно.", "err");
           return;
         }
         if (dbFields(desc).some(function (f) { return f.name === clean; })) {
-          window.alert("Такое поле уже есть.");
+          toast("Такое поле уже есть.", "err");
           return;
         }
         dbFields(desc).push({ id: "df-" + Date.now(), name: clean });
@@ -6549,12 +6853,12 @@
             return;
           }
           if (desc.kind === "people" && profileBuiltinFields().indexOf(clean) !== -1) {
-            window.alert("«" + clean + "» — встроенное поле, такое имя занято.");
+            toast("«" + clean + "» — встроенное поле, такое имя занято.", "err");
             renderLayout();
             return;
           }
           if (dbFields(desc).some(function (x) { return x !== f && x.name === clean; })) {
-            window.alert("Такое поле уже есть.");
+            toast("Такое поле уже есть.", "err");
             renderLayout();
             return;
           }
@@ -6586,14 +6890,15 @@
         "Выбор при вставке {{поле:#}} — из всех значений, {{поле:#группа}} — связанные по одной записи. " +
         "При совпадении тега человек первичнее записи.";
       target.appendChild(dbHelp);
+      // v0.2: глобальные настройки и бэкапы переехали во вкладку «Настройки».
+    }
 
-
-
-      var otherTitle = document.createElement("div");
-      otherTitle.className = "section-title";
-      otherTitle.style.marginTop = "14px";
-      otherTitle.textContent = "Прочее";
-      target.appendChild(otherTitle);
+    // v0.2: вкладка «Настройки» — глобальные параметры, хоткеи, бэкапы.
+    function renderSettingsTab(target) {
+      var title = document.createElement("div");
+      title.className = "section-title";
+      title.textContent = "Настройки";
+      target.appendChild(title);
 
       var panel = document.createElement("div");
       panel.className = "panel";
@@ -6601,27 +6906,48 @@
 
       panel.innerHTML =
         '<div class="line2">' +
-        '<input id="g-prefix" class="field" placeholder="Префикс тега" />' +
+        '<input id="g-prefix" class="field" placeholder="Префикс тега, например /" />' +
         '<input id="g-delay" class="field" type="number" min="0" placeholder="Задержка печати (мс)" />' +
-        "</div>";
+        "</div>" +
+        '<div class="line2" style="margin-top:8px">' +
+        '<input id="g-hotkey-menu" class="field" placeholder="Хоткей меню, например ctrl+shift+k" />' +
+        '<input id="g-hotkey-settings" class="field" placeholder="Хоткей настроек, например ctrl+shift+l" />' +
+        "</div>" +
+        '<div style="margin-top:10px"><label><input id="g-images" type="checkbox" /> Вставлять картинки шаблона (если есть)</label></div>' +
+        '<p class="muted" style="margin-top:8px">Хоткей: модификаторы через «+» — ctrl / shift / alt и буква. ' +
+        "Примеры: <code>ctrl+shift+k</code>, <code>alt+m</code>. Пустое поле = хоткей выключен. Раскладка не важна.</p>";
 
       var prefixEl = panel.querySelector("#g-prefix");
       var delayEl = panel.querySelector("#g-delay");
+      var imagesEl = panel.querySelector("#g-images");
+      var hkMenuEl = panel.querySelector("#g-hotkey-menu");
+      var hkSettingsEl = panel.querySelector("#g-hotkey-settings");
 
       prefixEl.value = draft.triggerPrefix;
       delayEl.value = String(draft.typingDelay || 0);
+      imagesEl.checked = draft.attachImages !== false;
+      hkMenuEl.value = draft.hotkeyMenu || "";
+      hkSettingsEl.value = draft.hotkeySettings || "";
+
+      function cleanHotkey(raw) {
+        return String(raw || "").trim().toLowerCase().replace(/\s+/g, "");
+      }
 
       function saveGeneral() {
         draft.triggerPrefix = prefixEl.value || "/";
         draft.typingDelay = Math.max(0, Number(delayEl.value) || 0);
+        draft.attachImages = imagesEl.checked;
+        draft.hotkeyMenu = cleanHotkey(hkMenuEl.value);
+        draft.hotkeySettings = cleanHotkey(hkSettingsEl.value);
       }
 
-      [prefixEl, delayEl].forEach(function (el) {
+      [prefixEl, delayEl, hkMenuEl, hkSettingsEl].forEach(function (el) {
         el.addEventListener("input", saveGeneral);
         el.addEventListener("change", saveGeneral);
       });
+      imagesEl.addEventListener("change", saveGeneral);
 
-      // v3.2.0: бэкапы с откатом.
+      // Бэкапы (перенесены из «База данных»).
       var backupTitle = document.createElement("div");
       backupTitle.className = "section-title";
       backupTitle.style.marginTop = "14px";
@@ -6659,6 +6985,86 @@
       });
     }
 
+    // v0.2: вкладка «Справка» — все переменные и правила в одном месте.
+    function renderHelpTab(target) {
+      var title = document.createElement("div");
+      title.className = "section-title";
+      title.textContent = "Справка";
+      target.appendChild(title);
+
+      var howto = document.createElement("div");
+      howto.className = "help muted";
+      howto.innerHTML =
+        "Как использовать: введите <code>" +
+        escapeHtml(draft.triggerPrefix) +
+        "tag</code> + пробел в любом поле ввода. Также <code>/буква</code> — быстрый список тегов. " +
+        "Для папок и навигации используйте <code>//</code>.<br>" +
+        "Домены шаблона: пусто = из настроек папки (⚙️), там пусто = на всех сайтах. Например <code>t.me</code> = t.me и все поддомены.";
+      target.appendChild(howto);
+
+      var varsTitle = document.createElement("div");
+      varsTitle.className = "section-title";
+      varsTitle.style.marginTop = "14px";
+      varsTitle.textContent = "Стандартные переменные";
+      target.appendChild(varsTitle);
+
+      var varsHelp = document.createElement("div");
+      varsHelp.className = "help muted";
+      varsHelp.innerHTML =
+        "<code>{{name}}</code> - имя человека.<br>" +
+        "<code>{{surname}}</code> - фамилия человека.<br>" +
+        "<code>{{fullname}}</code> - имя + фамилия.<br>" +
+        "<code>{{company}}</code> - компания человека.<br>" +
+        "<code>{{email}}</code> - email человека.<br>" +
+        "<code>{{phone}}</code> - телефон человека.<br>" +
+        "<code>{{position}}</code> - должность человека.<br>" +
+        "<code>{{name:тег}}</code> - поле конкретного человека по тегу (например {{name:david}}). Без тега — активный.<br>" +
+        "<code>{{поле:тег}}</code> - поле записи: {{telegram:david}} — у конкретного; {{telegram}} без тега — у активной записи категории-владельца (люди — активный человек).<br>" +
+        "<code>{{поле:тег}}</code> - также записи справочников: {{телефон:acme}}. Человек с тем же тегом первичнее.<br>" +
+        "<code>{{поле:#}}</code> - выбор при вставке: {{name:#}} покажет все имена (люди + справочники), {{telegram:#}} — все telegram.<br>" +
+        "Выборка строго по имени поля: телефоны людей — {{phone:#}}, поле справочника «телефон» — {{телефон:#}}.<br>" +
+        "<code>{{поле:#группа}}</code> - СВЯЗАННАЯ выборка (выборочно): {{name:#кл}} + {{phone:#кл}} — выбрал запись один раз, остальные поля подтянулись сами.<br>" +
+        "<code>{{date}}</code> - дата №1 (один выбор для всех {{date}} / {{date+N}}).<br>" +
+        "<code>{{date+N}}</code> / <code>{{date-N}}</code> - сдвиг в днях от даты №1.<br>" +
+        "<code>{{date2}}</code> / <code>{{date2+N}}</code> - НЕЗАВИСИМАЯ дата №2 (свой выбор). Так же date3..date9.<br>" +
+        "<code>{{date(\"Подпись\")}}</code> / <code>{{date+7(\"Подпись\")}}</code> - дата с подписью: в окне вставки вместо тега видно «Подпись», повтор той же подписи считает от той же даты.<br>" +
+        "<code>{{datetoday}}</code> - всегда сегодняшняя дата (не спрашивает).<br>" +
+        "<code>{{datetoday+N}}</code> / <code>{{datetoday-N}}</code> - сдвиг от сегодняшней даты.<br>" +
+        "<code>{{time}}</code> - время №1 (один выбор для всех {{time*}}).<br>" +
+        "<code>{{time+N}}</code> / <code>{{time-N}}</code> - сдвиг в часах от времени №1.<br>" +
+        "<code>{{time2}}</code> / <code>{{time2+N}}</code> - НЕЗАВИСИМОЕ время №2. Так же time3..time9.<br>" +
+        "<code>{{time(\"Подпись\")}}</code> - время с подписью, заполняется прямо в тексте.<br>" +
+        "<code>{{var(\"Подсказка\")}}</code> - своя переменная с подписью: в окне вставки видно «Подсказка».<br>" +
+        "<code>{{timetoday}}</code> - всегда текущее время (не спрашивает).<br>" +
+        "<code>{{timetoday+N}}</code> / <code>{{timetoday-N}}</code> - сдвиг от текущего времени.<br>" +
+        "<code>{{text}}</code> / {{text2}} / {{text(\"Подпись\")}} - свободный ввод с клавиатуры при вставке (обязательный).<br>" +
+        "<code>{{pick:a|b|c}}</code> - случайный вариант.<br>" +
+        "<code>{{upper:text}}</code> - верхний регистр.<br>" +
+        "<code>{{lower:TEXT}}</code> - нижний регистр.<br>" +
+        "<code>{{calc:expr}}</code> - математика (+ - * / % скобки).";
+      target.appendChild(varsHelp);
+
+      var cvTitle = document.createElement("div");
+      cvTitle.className = "section-title";
+      cvTitle.style.marginTop = "14px";
+      cvTitle.textContent = "Пользовательские переменные";
+      target.appendChild(cvTitle);
+
+      var cvHelp = document.createElement("div");
+      cvHelp.className = "help muted";
+      cvHelp.innerHTML =
+        "<b>Что можно использовать в значении переменной:</b><br>" +
+        "<code>{{name}}</code>, <code>{{surname}}</code>, <code>{{fullname}}</code>, <code>{{company}}</code>, <code>{{position}}</code>, <code>{{email}}</code>, <code>{{phone}}</code>.<br>" +
+        "Все семь берутся из активной записи категории-владельца (База данных; человека при вставке можно выбрать другого).<br>" +
+        "<code>{{date}}</code>, <code>{{date+N}}</code>, <code>{{date-N}}</code>.<br>" +
+        "<code>{{datetoday}}</code>, <code>{{datetoday+N}}</code>, <code>{{datetoday-N}}</code>.<br>" +
+        "<code>{{time}}</code>, <code>{{time+N}}</code>, <code>{{time-N}}</code>.<br>" +
+        "<code>{{timetoday}}</code>, <code>{{timetoday+N}}</code>, <code>{{timetoday-N}}</code>.<br>" +
+        "<code>{{pick:a|b|c}}</code>, <code>{{upper:text}}</code>, <code>{{lower:TEXT}}</code>.<br>" +
+        "<code>{{calc:expr}}</code> - формулы для расчетов (например <code>{{calc:summa*0.2}}</code>).";
+      target.appendChild(cvHelp);
+    }
+
     // v3.2.0: хоткеи настроек — Ctrl+S сохранить, "/" в поиск шаблонов.
     // v3.11.0: слушаем на корне настроек (пузырек) и глушим всплытие дальше:
     // страница-хост живет в том же документе, и ее однобуквенные хоткеи (h, / и т.д.)
@@ -6680,7 +7086,7 @@
             if ((event.ctrlKey || event.metaKey) && String(event.key || "").toLowerCase() === "s") {
               event.preventDefault();
               persistDraftToConfig();
-              window.alert("Изменения сохранены, предыдущая версия — в бэкапах (База данных)");
+              toast("Изменения сохранены, предыдущая версия — в бэкапах (вкладка «Настройки»)", "ok");
               renderLayout();
               event.stopPropagation();
               return;
@@ -6706,6 +7112,43 @@
         }
       });
     });
+
+    // ---------- v0.2: тосты вместо alert + запуск защиты черновика ----------
+    var toastBox = null;
+    function toast(message, kind) {
+      try {
+        if (!toastBox || !toastBox.parentNode) {
+          toastBox = document.createElement("div");
+          toastBox.style.cssText =
+            "position:fixed;bottom:20px;right:20px;z-index:2147483647;display:flex;flex-direction:column;gap:8px;";
+          document.body.appendChild(toastBox);
+        }
+        var el = document.createElement("div");
+        var bg = kind === "err" ? "#7f1d1d" : kind === "ok" ? "#14532d" : "#1f2937";
+        var border = kind === "err" ? "#ef4444" : kind === "ok" ? "#22c55e" : "#374151";
+        el.style.cssText =
+          "background:" + bg + ";color:#f3f4f6;border:1px solid " + border + ";border-radius:8px;" +
+          "padding:10px 14px;font-size:14px;max-width:380px;box-shadow:0 8px 24px rgba(0,0,0,0.4);" +
+          "white-space:pre-line;";
+        el.textContent = String(message || "");
+        toastBox.appendChild(el);
+        window.setTimeout(function () {
+          if (el.parentNode) {
+            el.parentNode.removeChild(el);
+          }
+        }, 4000);
+      } catch (error) {
+        /* ignore */
+      }
+    }
+
+    try {
+      checkSavedDraft(); // баннер восстановления, если есть автосейв
+      window.setInterval(saveDraftSnapshot, 15000);
+      window.addEventListener("beforeunload", saveDraftSnapshot);
+    } catch (error) {
+      debugLog("draft protection setup failed", error);
+    }
 
     renderLayout();
   }
