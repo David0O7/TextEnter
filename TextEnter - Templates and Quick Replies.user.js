@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         TextEnter - Templates and Quick Replies
 // @namespace    https://textenter.local/
-// @version      0.4
+// @version      0.5
 // @description  Message templates, tags, // menu, custom variables, tagged people profiles, backups, and isolated settings workspace
 // @author       TextEnter Studio
 // @license      MIT
 // @match        *://*/*
+// @match        https://david0o7.github.io/TextEnter/settings.html*
 // @include      about:blank*
 // @noframes
 // @grant        GM_getValue
@@ -730,14 +731,27 @@
     return readBackupIndex();
   }
 
-  // ---------- v0.4: отдельная вкладка настроек ----------
-  // Настройки открываются в чистой вкладке about:blank (скрипт внедряется туда
-  // через @include about:blank* и строит страницу настроек с нуля — без
-  // перезагрузки текущего сайта и без захвата его DOM). Если менеджер скриптов
-  // не умеет внедряться в about:blank — через 2 секунды откатываемся к старому
-  // способу (текущий URL + ?textenter_settings=1).
+  // ---------- v0.5: отдельная вкладка настроек ----------
+  // Настройки открываются в выделенной вкладке settings.html на GitHub Pages:
+  // скрипт матчится на этот URL (@match выше) и строит страницу настроек сам.
+  // Текущая страница сайта не перезагружается и не захватывается. Если страница
+  // недоступна (нет сети, Pages лежит) — через 4с откат к старому способу
+  // (текущий URL + ?textenter_settings=1). Пустые about:blank вкладки тоже
+  // поддерживаются (некоторые менеджеры их внедряют через @include).
+  var SETTINGS_URL = "https://david0o7.github.io/TextEnter/settings.html";
+
   function isBlankTab() {
     return String(window.location.href).indexOf("about:blank") === 0;
+  }
+
+  function isHostedSettingsPage() {
+    try {
+      return window.location.protocol === "https:" &&
+        window.location.hostname === "david0o7.github.io" &&
+        String(window.location.pathname).indexOf("/TextEnter/settings.html") === 0;
+    } catch (error) {
+      return false;
+    }
   }
 
   function isBlankSettingsTab() {
@@ -759,7 +773,8 @@
   }
 
   function blankSettingsHostUrl() {
-    // URL страницы, из которой открыли настройки (для шаринг-ссылок в пустой вкладке).
+    // URL страницы, из которой открыли настройки (для шаринг-ссылок — на
+    // выделенной вкладке настроек location не годится).
     try {
       var raw = safeGet(SETTINGS_OPEN_FLAG, "");
       var data = JSON.parse(raw);
@@ -775,12 +790,12 @@
 
   function isSettingsMode() {
     var params = new URLSearchParams(window.location.search);
-    return params.has(SETTINGS_PARAM) || isBlankSettingsTab();
+    return params.has(SETTINGS_PARAM) || isHostedSettingsPage() || isBlankSettingsTab();
   }
 
   function openSettingsPage() {
-    // v0.4: сначала пробуем чистую пустую вкладку; если скрипт туда не внедрился
-    // (нет подтверждения через postMessage) — старый способ с параметром.
+    // v0.5: открываем выделенную вкладку настроек; подтверждение — метка в
+    // GM-хранилище и/или postMessage. Нет подтверждения — старый способ.
     if (isSettingsMode()) {
       // Уже в настройках (команда меню доступна и там) — второго таба не создаем.
       return;
@@ -792,9 +807,9 @@
     var opened = null;
     try {
       if (typeof GM_openInTab === "function") {
-        opened = GM_openInTab("about:blank", { active: true, insert: true, setParent: true });
+        opened = GM_openInTab(SETTINGS_URL, { active: true, insert: true, setParent: true });
       } else {
-        opened = window.open("about:blank", "_blank");
+        opened = window.open(SETTINGS_URL, "_blank");
       }
     } catch (error) {
       opened = null;
@@ -821,8 +836,8 @@
       if (confirmed) {
         return;
       }
-      // Fallback: менеджер скриптов не внедрился в about:blank — закрываем пустую
-      // вкладку и открываем настройки поверх текущей страницы, как раньше.
+      // Fallback: скрипт не запустился на выделенной странице (нет сети и т.п.)
+      // — закрываем вкладку и открываем настройки поверх текущей страницы.
       try {
         if (opened && typeof opened.close === "function") {
           opened.close();
@@ -836,7 +851,7 @@
       } else {
         window.open(finalUrl, "_blank");
       }
-    }, 2000);
+    }, 4000);
   }
 
   function registerCommands() {
@@ -3714,7 +3729,7 @@
     // v0.4: если это пустая вкладка about:blank — сообщаем открывателю, что настройки
     // запустились (иначе он через 2с откатится к старому способу), и поддерживаем
     // флаг свежим, чтобы F5 в этой вкладке не показывал пустую страницу.
-    if (isBlankTab()) {
+    if (isHostedSettingsPage() || isBlankTab()) {
       // Подтверждение #1 (надежное): метка в GM-хранилище — opener может не существовать.
       try {
         var rawFlag = safeGet(SETTINGS_OPEN_FLAG, "");
@@ -3729,16 +3744,19 @@
           window.opener.postMessage("textenter:settings-opened", "*");
         }
       } catch (error) { /* ignore */ }
-      // Поддерживаем флаг свежим, чтобы F5 в этой вкладке не показывал пустую страницу.
-      try {
-        window.setInterval(function () {
-          var raw = safeGet(SETTINGS_OPEN_FLAG, "");
-          var data = raw ? JSON.parse(raw) : {};
-          data.at = Date.now();
-          data.confirmed = true;
-          safeSet(SETTINGS_OPEN_FLAG, JSON.stringify(data));
-        }, 10000);
-      } catch (error) { /* ignore */ }
+      // В пустой about:blank вкладке поддерживаем флаг свежим, чтобы F5 не давал
+      // пустую страницу; выделенной странице настроек это не нужно (URL постоянный).
+      if (isBlankTab()) {
+        try {
+          window.setInterval(function () {
+            var raw = safeGet(SETTINGS_OPEN_FLAG, "");
+            var data = raw ? JSON.parse(raw) : {};
+            data.at = Date.now();
+            data.confirmed = true;
+            safeSet(SETTINGS_OPEN_FLAG, JSON.stringify(data));
+          }, 10000);
+        } catch (error) { /* ignore */ }
+      }
     }
     try {
       document.title = "TextEnter - Настройки";
